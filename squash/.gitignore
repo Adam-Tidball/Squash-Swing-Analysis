@@ -1,0 +1,8 @@
+# No footage, poses or run outputs in git (the RFP's rule). Paths are
+# relative to squash/. The M0 tools write into running/data/, which
+# running/.gitignore already covers.
+data/
+*.mov
+*.MOV
+*.mp4
+*.m4v

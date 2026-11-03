@@ -1,0 +1,9 @@
+Squash Swing Analysis
+Copyright 2026 Adam Tidball
+
+This repository is a fork of vision-demos by Jeremy Park
+(https://github.com/jeremyipark/vision-demos), licensed under the Apache
+License, Version 2.0 (see LICENSE). The upstream history is preserved in git.
+
+Files under squash/ are new work. Files copied from upstream and modified
+will say so in a header naming the original path.

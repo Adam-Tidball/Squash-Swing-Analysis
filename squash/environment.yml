@@ -1,0 +1,22 @@
+# conda env create -f squash/environment.yml && conda activate squash
+#
+# The running demo's stack (Python 3.11, ffmpeg, OpenCV, NumPy, Matplotlib,
+# Pillow), plus the deadlift demo's System One SDK for the key-frame reads,
+# plus pytest.
+name: squash
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ffmpeg
+  - py-opencv
+  - numpy
+  - matplotlib-base
+  - pillow
+  - rich
+  - python-dotenv
+  - pytest
+  - pip
+  - pip:
+      - openai>=1.40
+      - typesafe-sdk==0.7.0
