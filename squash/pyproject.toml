@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "squash-swing"
+version = "0.1.0"
+description = "Per-swing technique analysis from iPhone slo-mo squash practice clips."
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "numpy>=1.26",
+    "openai>=1.40",
+    "opencv-python-headless>=4.9",
+    "python-dotenv>=1.0",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+local = ["mediapipe"]
+vision = ["typesafe-sdk==0.7.0"]
+test = ["pytest"]
+
+[project.scripts]
+swing = "swing.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["swing*", "m0*"]

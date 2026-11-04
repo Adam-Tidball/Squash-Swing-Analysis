@@ -6,6 +6,13 @@ first. Anything that changes cost or scope is an open question in
 
 | Date | Decision | Reason |
 |---|---|---|
+| 2026-11-04 | M1 started before the M0 review | Adam asked for it. The RFP's gate exists because real footage may change the design, so the points M0 could overturn sit behind interfaces (pose backend, timing, coarse rate). |
+| 2026-11-04 | `--max-billed-frames` is required for the gateway backend, with no default | A default would be an invented cost limit. Requiring it means no run can bill without a stated ceiling. |
+| 2026-11-04 | Coarse requests are chunked at 900 frames | It's the gateway's own default cap, and larger limits are unverified. M0 measures the real limit. |
+| 2026-11-04 | Source cache identity = size + SHA-256 of the first and last 4 MB; renditions hashed in full | This survives renames and touches, and changes with any re-export or trim. Hashing a 2 GB original on every run is slow. |
+| 2026-11-04 | Upstream `video.py` not copied; `swing.ingest` does renditions itself | M1 needs frame-exact seeking, resampling in real time, and a real-time map of every frame, which upstream's converter doesn't do. A copy would be dead code. |
+| 2026-11-04 | The clipped-body check uses the largest person until the one-player lock (FR-6) lands in M2 | A cropped player is usually the largest person in frame. M2 replaces this with the locked player. |
+| 2026-11-04 | `--capture-fps` equal to the file's rate declares normal-speed video | Ordinary iPhone video carries Apple metadata and was otherwise always "unknown". |
 | 2026-11-03 | `--min-score` gate (0.5 in the YouTube check) applies to peak finding, visibility and gaps, not to jitter | It's a diagnostic setting, not a v1 threshold. Lost joints carry coordinates snapped onto other body parts, and on two clips they produced every false peak. |
 | 2026-11-03 | Timing reads decoded frame timestamps, not packets | A screen recording had 582 packets for 464 frames. |
 | 2026-11-03 | MediaPipe Pose Landmarker (heavy) as the local stand-in backend for M0 only | It's on PyPI, its model is on a host this environment can reach, and it returns per-keypoint visibility. The model card lists Apache-2.0; confirm before any adoption past M0. |

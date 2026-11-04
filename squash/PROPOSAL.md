@@ -6,7 +6,8 @@ review. This document is the proposal. `m0/` holds the M0 tools, which are
 ready to run once there is footage and a `VLMRUN_API_KEY`. `M0_NOTE.md` is the
 note M0 will produce, with its slots still empty.
 
-**Status:** M0 tooling is built and tested offline (17 tests, plus an
+**Status (2026-11-04):** M1 foundations are built (`swing/`, see README). M0
+tooling is built and tested offline (17 tests, plus an
 end-to-end run against a fake gateway). M0 itself has **not** run: there is no
 footage, and this sandbox can't reach `vlm.run`. Nothing below is a measured
 result on real squash video.
