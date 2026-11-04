@@ -54,6 +54,19 @@ def test_peak_and_window_find_the_fast_frame():
     assert report["window"]["end_frame"] == 400 + 180
 
 
+def test_low_score_jump_does_not_become_the_peak():
+    fps, n = 60.0, 200
+    xy = standing(n)
+    t = np.arange(n)
+    xy[:, kq.J["right_wrist"], 0] = 480 + 150 * np.tanh((t - 60) / 6)   # real swing at 60
+    xy[150:160, kq.J["right_wrist"]] = (900, 100)    # lost joint snapped elsewhere for 10 frames
+    scores = np.ones((n, 17))
+    scores[150:160, kq.J["right_wrist"]] = 0.01
+    assert kq.analyze(xy, scores, fps=fps, hand="right")["peak"]["frame"] in range(148, 162)
+    gated = kq.analyze(xy, scores, fps=fps, hand="right", min_score=0.5)
+    assert abs(gated["peak"]["frame"] - 60) <= 1
+
+
 def test_gap_reported_in_ms():
     fps = 240.0
     xy = standing(100)
@@ -161,6 +174,12 @@ def test_known_duration_check_ac4():
     assert ok["passes_ac4"] and ok["relative_error"] == pytest.approx(0.0, abs=1e-6)
     bad = timing_probe.known_duration_check(r, known_seconds=2.0, event_frames=60)
     assert not bad["passes_ac4"]
+
+
+def test_duplicate_timestamps_flagged():
+    pts = np.sort(np.concatenate([np.arange(100) / 60.0, [10 / 60.0, 20 / 60.0]]))
+    r = timing_probe.classify(probe_dict("60/1"), pts)
+    assert r.irregular_intervals == 2 and r.measured_fps == pytest.approx(60.0)
 
 
 def test_irregular_intervals_flagged():

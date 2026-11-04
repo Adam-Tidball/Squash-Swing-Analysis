@@ -198,20 +198,45 @@ def wrist_swaps(xy: np.ndarray, unit: float) -> list[int]:
     return hits
 
 
+def gate(xy: np.ndarray, scores: np.ndarray | None, min_score: float | None) -> np.ndarray:
+    """Drop keypoints whose score is under *min_score* (a copy; NaN = not seen).
+
+    Without this, a joint the model has lost still has coordinates, usually
+    snapped onto another body part, and its jumps read as the fastest motion
+    in the clip.
+    """
+    if scores is None or min_score is None:
+        return xy
+    out = xy.copy()
+    out[scores < min_score] = np.nan
+    return out
+
+
 def analyze(xy: np.ndarray, scores: np.ndarray | None, *, fps: float, hand: str,
             frame_index: np.ndarray | None = None, before: float = 1.0,
-            after: float = 0.75) -> dict:
-    """Quality report for the whole clip and for the window around the speed peak."""
+            after: float = 0.75, min_score: float | None = None) -> dict:
+    """Quality report for the whole clip and for the window around the speed peak.
+
+    Visibility, jitter and gaps are reported on the raw keypoints. The speed
+    peak (the contact proxy) is found on keypoints gated at *min_score*, and
+    only where the hitting wrist was actually seen, never on a filled gap.
+    """
     n = len(xy)
     frame_index = np.arange(n) if frame_index is None else frame_index
     unit = torso_length(xy)
-    speed = wrist_speed(xy, fps, hand, unit)
+    gated = gate(xy, scores, min_score)
+    seen = np.isfinite(gated[:, J[f"{hand}_wrist"], 0])
+    speed = wrist_speed(gated, fps, hand, unit)
+    speed[~seen] = np.nan
     peak = int(np.nanargmax(speed))
     lo, hi = max(0, peak - round(before * fps)), min(n, peak + round(after * fps) + 1)
 
     def block(sl: slice) -> dict:
         part = xy[sl]
-        vis = np.isfinite(part[..., 0])
+        # Seen = returned and, when gating, scored at or above min_score. A
+        # model that always returns coordinates (MediaPipe does) would
+        # otherwise report 100% visibility and no gaps while it is guessing.
+        vis = np.isfinite(gated[sl][..., 0])
         jit = jitter(part, unit)
         hit = J[f"{hand}_wrist"]
         out = {
@@ -235,6 +260,7 @@ def analyze(xy: np.ndarray, scores: np.ndarray | None, *, fps: float, hand: str,
         "hand": hand,
         "torso_length_px": round(unit, 2),
         "scores_present": scores is not None,
+        "min_score": min_score,
         "peak": {
             "frame": int(frame_index[peak]),
             "seconds": round(float(frame_index[peak]) / fps, 4),
@@ -283,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--width", type=int, required=True, help="inference video width, px")
     ap.add_argument("--height", type=int, required=True, help="inference video height, px")
     ap.add_argument("--hand", choices=("right", "left"), default="right")
+    ap.add_argument("--min-score", type=float,
+                    help="ignore keypoints scored below this when finding the speed peak")
     ap.add_argument("--json", type=Path, help="write the full report here")
     args = ap.parse_args(argv)
 
@@ -290,7 +318,8 @@ def main(argv: list[str] | None = None) -> int:
     persons, crowded = lock_player(frames)
     xy, scores, field = keypoint_arrays(persons, width=args.width, height=args.height)
     report = analyze(xy, scores, fps=args.fps, hand=args.hand,
-                     frame_index=np.array([f["index"] for f in frames]))
+                     frame_index=np.array([f["index"] for f in frames]),
+                     min_score=args.min_score)
     report["score_field"] = field
     report["frames_with_multiple_people"] = crowded
     report["frames_with_nobody"] = sum(p is None for p in persons)

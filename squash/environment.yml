@@ -20,3 +20,4 @@ dependencies:
   - pip:
       - openai>=1.40
       - typesafe-sdk==0.7.0
+      - mediapipe          # m0.local_pose only; the stand-in, not ViTPose

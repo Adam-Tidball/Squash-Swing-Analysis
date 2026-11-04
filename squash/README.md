@@ -56,6 +56,28 @@ To try the whole path without a key or cost, add `--fake-gateway` to step 2.
 It runs a synthetic stick figure through the real pipeline. Nothing it
 produces says anything about real footage.
 
+## Without the gateway, or with outside clips
+
+`m0.local_pose` runs MediaPipe Pose Landmarker locally and writes
+gateway-shaped poses, so `keypoint_quality` reads them unchanged.
+It is a stand-in, not ViTPose. Download its model (Apache-2.0) first, and keep
+it out of git:
+
+```bash
+pip install mediapipe
+curl -LO https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task
+python -m m0.local_pose clip.mov --model pose_landmarker_heavy.task \
+    --start 1.12 --duration 3.97 --out data/clip/poses.json
+python -m m0.keypoint_quality data/clip/poses.json --fps 60 \
+    --width 2064 --height 1166 --hand right --min-score 0.5
+```
+
+Clips from YouTube or other edited sources can show how pose handles a
+squash arm. They can't support any timing result, because slow motion is
+usually edited in. Keep a segment inside one camera shot: a cut reads as the
+fastest motion in the clip. Only use footage you have permission to use.
+Example: [m0/findings/2026-11-03-youtube-screen-recordings.md](m0/findings/2026-11-03-youtube-screen-recordings.md).
+
 ## Test
 
 ```bash

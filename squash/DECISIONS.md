@@ -6,6 +6,9 @@ first. Anything that changes cost or scope is an open question in
 
 | Date | Decision | Reason |
 |---|---|---|
+| 2026-11-03 | `--min-score` gate (0.5 in the YouTube check) applies to peak finding, visibility and gaps, not to jitter | It's a diagnostic setting, not a v1 threshold. Lost joints carry coordinates snapped onto other body parts, and on two clips they produced every false peak. |
+| 2026-11-03 | Timing reads decoded frame timestamps, not packets | A screen recording had 582 packets for 464 frames. |
+| 2026-11-03 | MediaPipe Pose Landmarker (heavy) as the local stand-in backend for M0 only | It's on PyPI, its model is on a host this environment can reach, and it returns per-keypoint visibility. The model card lists Apache-2.0; confirm before any adoption past M0. |
 | 2026-11-03 | Each M0 key-frame question includes a "cannot tell" or "not visible" label | The RFP's rule: low confidence becomes Can't assess, never a guess. A question without an abstain option forces a guess. |
 | 2026-11-03 | Key frames come from poses: contact = peak hitting-wrist speed; backswing and finish = highest wrist within 0.6 s either side | These are the RFP's contact proxy, plus the simplest definitions that keypoints support. 0.6 s is a starting value, to be checked by eye on the M0 crops. |
 | 2026-11-03 | Vision crops pad the player box by 60% on every side (deadlift uses 15%) | The racket extends well past the body box. Deadlift only needed the back. |

@@ -78,13 +78,23 @@ def ffprobe_json(path: Path) -> dict:
     return json.loads(proc.stdout)
 
 
-def packet_times(path: Path) -> np.ndarray:
-    """Presentation timestamps of every video packet, sorted, in media seconds."""
+def frame_times(path: Path) -> np.ndarray:
+    """Timestamps of every *decoded* frame, sorted, in media seconds.
+
+    Decoded frames, not container packets: a screen recording or an edited
+    file can hold packets that are never shown (one test file had 582 packets
+    for 464 frames, 115 of them sharing a timestamp), and counting those
+    makes frame index stop being a clock.
+    """
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)],
+         "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True, check=True)
-    values = [float(v) for v in proc.stdout.split() if v.strip() not in ("", "N/A")]
+    values = []
+    for line in proc.stdout.split():
+        field = line.strip().strip(",").split(",")[0]
+        if field and field != "N/A":
+            values.append(float(field))
     return np.sort(np.array(values, dtype=float))
 
 
@@ -120,9 +130,11 @@ def classify(probe: dict, pts: np.ndarray, *, capture_fps: float | None = None) 
                   for s in streams if s.get("codec_type") == "audio"), None)
 
     dts = np.diff(pts) if pts.size > 1 else np.array([])
+    duplicates = int(np.sum(dts <= 0))
     dts = dts[dts > 0]
     measured = float(1.0 / np.median(dts)) if dts.size else None
     irregular = int(np.sum(np.abs(dts / np.median(dts) - 1) > IRREGULAR_TOLERANCE)) if dts.size else 0
+    irregular += duplicates
     media_seconds = float(pts[-1] - pts[0] + (np.median(dts) if dts.size else 0)) if pts.size else 0.0
 
     report = TimingReport(
@@ -171,7 +183,8 @@ def classify(probe: dict, pts: np.ndarray, *, capture_fps: float | None = None) 
     if irregular:
         report.notes.append(
             f"{irregular} frame intervals differ from the median by more than "
-            f"{IRREGULAR_TOLERANCE:.0%}: variable frame rate or dropped frames. "
+            f"{IRREGULAR_TOLERANCE:.0%} or repeat a timestamp: variable frame rate, "
+            "dropped or duplicated frames. "
             "Frame index is not a clock here; use timestamps.")
     if data_streams:
         report.notes.append(
@@ -205,7 +218,7 @@ def known_duration_check(report: TimingReport, *, known_seconds: float,
 
 
 def probe(path: Path, *, capture_fps: float | None = None) -> TimingReport:
-    return classify(ffprobe_json(path), packet_times(path), capture_fps=capture_fps)
+    return classify(ffprobe_json(path), frame_times(path), capture_fps=capture_fps)
 
 
 def main(argv: list[str] | None = None) -> int:
