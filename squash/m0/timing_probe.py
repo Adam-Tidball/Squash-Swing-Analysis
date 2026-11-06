@@ -13,10 +13,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from swing.timing import (  # noqa: F401  (re-exported for the M0 tools and tests)
-    HFR_MIN_FPS, IRREGULAR_TOLERANCE, TimingReport, classify, ffprobe_json,
-    frame_times, known_duration_check, probe,
-)
+from swing.timing import classify, known_duration_check, probe  # noqa: F401  (classify: tests)
 
 
 def main(argv: list[str] | None = None) -> int:

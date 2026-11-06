@@ -1,24 +1,14 @@
 # conda env create -f squash/environment.yml && conda activate squash
 #
-# The running demo's stack (Python 3.11, ffmpeg, OpenCV, NumPy, Matplotlib,
-# Pillow), plus the deadlift demo's System One SDK for the key-frame reads,
-# plus pytest.
+# Python 3.11 and ffmpeg from conda; everything else from pip, so there is
+# exactly one OpenCV build (opencv-contrib-python, via mediapipe). conda's
+# py-opencv beside it would give two `cv2` packages in one environment.
 name: squash
 channels:
   - conda-forge
 dependencies:
   - python=3.11
   - ffmpeg
-  - py-opencv
-  - numpy
-  - matplotlib-base
-  - pillow
-  - rich
-  - python-dotenv
-  - pytest
   - pip
   - pip:
-      - openai>=1.40
-      - typesafe-sdk==0.7.0
-      - mediapipe          # local stand-in backend, not ViTPose
-      - -e .               # the swing command
+      - -e .[m0,test]      # the swing command, plus the M0 tools' and tests' needs

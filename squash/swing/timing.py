@@ -18,11 +18,9 @@ no normal-speed ramps; the known-duration check (AC-4) exists for that.
 
 from __future__ import annotations
 
-import argparse
 import json
 import subprocess
-import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -59,7 +57,12 @@ class TimingReport:
     known_check: dict | None = None
 
 
-def _rate(text: str | None) -> float | None:
+class ProbeError(RuntimeError):
+    """ffprobe could not read the file."""
+
+
+def rate(text: str | None) -> float | None:
+    """An ffprobe rate such as ``"240/1"`` or ``"30000/1001"`` as a float."""
     if not text or text in ("0/0", "0"):
         return None
     if "/" in text:
@@ -68,11 +71,23 @@ def _rate(text: str | None) -> float | None:
     return float(text)
 
 
+def _ffprobe(args: list[str], path: Path) -> str:
+    proc = subprocess.run(["ffprobe", "-v", "error", *args, str(path)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise ProbeError(f"ffprobe cannot read {Path(path).name}: "
+                         f"{proc.stderr.strip()[-500:] or 'unknown error'}")
+    return proc.stdout
+
+
 def ffprobe_json(path: Path) -> dict:
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
-        capture_output=True, text=True, check=True)
-    return json.loads(proc.stdout)
+    return json.loads(_ffprobe(["-show_streams", "-show_format", "-of", "json"], path))
+
+
+def video_stream(path: Path) -> dict | None:
+    """The first video stream's ffprobe record, or None if the file has none."""
+    return next((s for s in ffprobe_json(path).get("streams") or []
+                 if s.get("codec_type") == "video"), None)
 
 
 def frame_times(path: Path) -> np.ndarray:
@@ -83,15 +98,13 @@ def frame_times(path: Path) -> np.ndarray:
     for 464 frames, 115 of them sharing a timestamp), and counting those
     makes frame index stop being a clock.
     """
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True, check=True)
+    out = _ffprobe(["-select_streams", "v:0", "-show_entries",
+                    "frame=best_effort_timestamp_time", "-of", "csv=p=0"], path)
     values = []
-    for line in proc.stdout.split():
-        field = line.strip().strip(",").split(",")[0]
-        if field and field != "N/A":
-            values.append(float(field))
+    for line in out.split():
+        value = line.strip().strip(",").split(",")[0]
+        if value and value != "N/A":
+            values.append(float(value))
     return np.sort(np.array(values, dtype=float))
 
 
@@ -129,10 +142,16 @@ def classify(probe: dict, pts: np.ndarray, *, capture_fps: float | None = None) 
     dts = np.diff(pts) if pts.size > 1 else np.array([])
     duplicates = int(np.sum(dts <= 0))
     dts = dts[dts > 0]
-    measured = float(1.0 / np.median(dts)) if dts.size else None
-    irregular = int(np.sum(np.abs(dts / np.median(dts) - 1) > IRREGULAR_TOLERANCE)) if dts.size else 0
-    irregular += duplicates
-    media_seconds = float(pts[-1] - pts[0] + (np.median(dts) if dts.size else 0)) if pts.size else 0.0
+    measured = None
+    irregular = duplicates
+    if dts.size:
+        typical = float(np.median(dts))
+        measured = 1.0 / typical
+        irregular += int(np.sum(np.abs(dts / typical - 1) > IRREGULAR_TOLERANCE))
+    # The span the frames cover, counting the last frame's own duration.
+    media_seconds = 0.0
+    if pts.size:
+        media_seconds = float(pts[-1] - pts[0]) + (1.0 / measured if measured else 0.0)
 
     report = TimingReport(
         path=str(fmt.get("filename", "")),
@@ -140,11 +159,11 @@ def classify(probe: dict, pts: np.ndarray, *, capture_fps: float | None = None) 
         width=int(video.get("width") or 0),
         height=int(video.get("height") or 0),
         rotation=rotation,
-        nominal_fps=_rate(video.get("r_frame_rate")),
-        average_fps=_rate(video.get("avg_frame_rate")),
+        nominal_fps=rate(video.get("r_frame_rate")),
+        average_fps=rate(video.get("avg_frame_rate")),
         measured_fps=round(measured, 3) if measured else None,
         n_frames=int(pts.size),
-        media_seconds=round(media_seconds, 4),
+        media_seconds=round(media_seconds, 6),   # 4 places moved clip ends by a frame
         irregular_intervals=irregular,
         apple_tags=apple,
         data_streams=data_streams,
@@ -152,6 +171,10 @@ def classify(probe: dict, pts: np.ndarray, *, capture_fps: float | None = None) 
     )
 
     fps = measured or report.average_fps or 0.0
+    if not pts.size:
+        report.verdict = "unknown"
+        report.notes.append("no decodable video frames: is this a video file?")
+        return report
     if fps >= HFR_MIN_FPS:
         report.verdict = "native"
         report.real_time_scale = 1.0
@@ -233,3 +256,10 @@ def known_duration_check(report: TimingReport, *, known_seconds: float,
 
 def probe(path: Path, *, capture_fps: float | None = None) -> TimingReport:
     return classify(ffprobe_json(path), frame_times(path), capture_fps=capture_fps)
+
+
+def probe_with_times(path: Path, *, capture_fps: float | None = None
+                     ) -> tuple[TimingReport, np.ndarray]:
+    """Like ``probe``, also returning the decoded frame times (media seconds)."""
+    pts = frame_times(path)
+    return classify(ffprobe_json(path), pts, capture_fps=capture_fps), pts

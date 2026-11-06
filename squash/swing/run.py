@@ -16,22 +16,30 @@ from datetime import datetime
 from pathlib import Path
 
 from . import config as cfg
+from .backends.base import PoseTrack
 from .checks import Check
 from .ingest import Capture, Source
 
 
-def _git_commit() -> str | None:
+def _git(*args: str) -> str | None:
     try:
-        out = subprocess.run(["git", "-C", str(cfg.SQUASH_DIR), "rev-parse", "--short", "HEAD"],
+        out = subprocess.run(["git", "-C", str(cfg.SQUASH_DIR), *args],
                              capture_output=True, text=True, timeout=5)
-        return out.stdout.strip() or None
+        return out.stdout.strip() if out.returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
         return None
 
 
-def new_run_dir(source: Source, *, output_dir: Path = cfg.OUTPUT_DIR) -> Path:
+def code_version() -> dict:
+    """The commit, and whether the working tree had uncommitted changes."""
+    status = _git("status", "--porcelain", "--", ".")
+    return {"commit": _git("rev-parse", "--short", "HEAD"),
+            "dirty": None if status is None else bool(status)}
+
+
+def new_run_dir(clip: Path, *, output_dir: Path = cfg.OUTPUT_DIR) -> Path:
     stamp = datetime.now().strftime(cfg.RUN_STAMP_FORMAT)
-    base = Path(output_dir) / f"{stamp}_{source.path.stem}"
+    base = Path(output_dir) / f"{stamp}_{Path(clip).stem}"
     path, n = base, 1
     while path.exists():
         n += 1
@@ -40,19 +48,28 @@ def new_run_dir(source: Source, *, output_dir: Path = cfg.OUTPUT_DIR) -> Path:
     return path
 
 
-def write_run(run_dir: Path, *, source: Source, capture: Capture, status: str,
-              checks: list[Check], backend: dict | None = None, track=None,
-              budget_limit: int | None = None, extra: dict | None = None) -> dict:
+def write_run(run_dir: Path, *, source: Source | None, capture: Capture, status: str,
+              checks: list[Check], request: dict | None = None,
+              config_overrides: dict | None = None, backend: dict | None = None,
+              track: PoseTrack | None = None, budget_limit: int | None = None,
+              extra: dict | None = None) -> dict:
+    """Write ``run.json`` (and ``checks.json``, and ``poses.json`` when posed).
+
+    Called on every exit path, including failures, so a run folder always
+    explains itself.
+    """
     record = {
         "run_id": run_dir.name,
         "created": datetime.now().isoformat(timespec="seconds"),
         "status": status,
-        "code_version": _git_commit(),
+        "code_version": code_version(),
+        "request": request,
         "capture": asdict(capture),
-        "source": {"path": str(source.path), "identity": source.identity,
-                   "real_fps": round(source.real_fps, 4),
-                   "real_seconds": round(source.real_seconds, 4),
-                   "timing": asdict(source.timing)},
+        "source": None if source is None else {
+            "path": str(source.path), "identity": source.identity,
+            "real_fps": round(source.real_fps, 4),
+            "real_seconds": round(source.real_seconds, 4),
+            "timing": asdict(source.timing)},
         "backend": backend,
         "pose": None if track is None else {
             "frames_posed": len(track.persons),
@@ -62,7 +79,7 @@ def write_run(run_dir: Path, *, source: Source, capture: Capture, status: str,
             "renditions": [c.rendition.describe() for c in track.chunks],
         },
         "checks": [c.as_dict() for c in checks],
-        "config": cfg.snapshot(),
+        "config": cfg.snapshot(**(config_overrides or {})),
         **(extra or {}),
     }
     (run_dir / "run.json").write_text(json.dumps(record, indent=2))

@@ -25,12 +25,8 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
-
-from .keypoint_quality import KPT_NAMES
-
-# BlazePose landmark index for each COCO-17 joint, in KPT_NAMES order.
-BLAZE_FOR_COCO = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+from swing.backends.mediapipe_local import landmarks_to_item
+from swing.upstream.skeleton import KPT_NAMES
 
 
 def run(clip: Path, model: Path, *, start: float = 0.0, duration: float | None = None
@@ -73,20 +69,8 @@ def run(clip: Path, model: Path, *, start: float = 0.0, duration: float | None =
             last_ms = ms
             result = landmarker.detect_for_video(image, ms)
             frames.append({"frame_id": i, "time": round(t, 5)})
-            for track, lms in enumerate(result.pose_landmarks):
-                pts = [lms[b] for b in BLAZE_FOR_COCO]
-                xs = np.array([p.x for p in lms])
-                ys = np.array([p.y for p in lms])
-                x0, y0 = float(np.clip(xs.min(), 0, 1)), float(np.clip(ys.min(), 0, 1))
-                x1, y1 = float(np.clip(xs.max(), 0, 1)), float(np.clip(ys.max(), 0, 1))
-                items.append({
-                    "frame_id": i, "track_id": track,
-                    "bbox_xywh": [round(x0, 4), round(y0, 4),
-                                  round(x1 - x0, 4), round(y1 - y0, 4)],
-                    "kpts_xy": [[round(p.x, 4), round(p.y, 4)]
-                                if 0 <= p.x <= 1 and 0 <= p.y <= 1 else [0, 0] for p in pts],
-                    "kpts_scores": [round(float(p.visibility), 4) for p in pts],
-                })
+            items += [landmarks_to_item(i, track, lms)
+                      for track, lms in enumerate(result.pose_landmarks)]
     cap.release()
 
     payload = {"content": {"object": "vid.pose.kpts", "kpts_labels": KPT_NAMES,

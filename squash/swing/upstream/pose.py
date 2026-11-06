@@ -1,6 +1,9 @@
 # Copied from vision-demos running/src/pose.py (Apache-2.0,
 # https://github.com/jeremyipark/vision-demos). Modified for squash:
-#   - KPT_NAMES imported from swing.upstream.skeleton (drawing code not copied)
+#   - none; byte-identical below this header. (skeleton.py beside it is the
+#     trimmed one, so `from .skeleton import KPT_NAMES` needs no change.)
+#   - note: request_poses is annotated `-> dict` upstream but returns
+#     (payload, usage); swing.backends.vlmrun relies on the tuple.
 
 """The Gateway request and the shape of what comes back."""
 

@@ -15,19 +15,18 @@ started before the M0 review, at Adam's request; M0 itself still needs real
 ## Set up
 
 ```bash
-conda env create -f squash/environment.yml
+conda env create -f squash/environment.yml     # also installs the swing command
 conda activate squash
 cp .env.example .env          # at the repo root; paste VLMRUN_API_KEY=
 ```
 
-ffmpeg must be on the PATH. Footage, poses and run outputs stay under
-`running/data/` and `squash/data/`, which are both gitignored.
+Without conda: Python 3.11+, ffmpeg on the PATH, then
+`pip install -e "squash[m0,test]"` from the repo root (`[m0]` brings
+MediaPipe and the M0 tools' needs; the bare package needs neither).
 
-Install the `swing` command into that environment (from the repo root):
-
-```bash
-pip install -e squash
-```
+Footage, poses and run outputs stay under `running/data/` and
+`squash/data/`, which are both gitignored. Set `SWING_DATA_DIR` to keep
+`swing`'s data somewhere else.
 
 ## Analyze a clip (M1)
 
@@ -39,26 +38,42 @@ swing analyze clip.MOV --stroke forehand --view side --hand right \
 ```
 
 - `--backend vlmrun` is ViTPose+ L on the VLM Run Gateway, the RFP's model.
-  It bills per frame, so `--max-billed-frames` is required. The run stops
-  **before** a request that would exceed it.
-- `--backend mediapipe` runs a local stand-in for free (model download below,
-  saved to `squash/data/models/`). `--backend fake` is synthetic, for tests.
+  It bills per frame, so `--max-billed-frames` is required. A run whose
+  uncached frames exceed it is refused before anything is sent. A missing
+  API key is reported before any work starts.
+- `--backend mediapipe` runs a local stand-in for free (model download below;
+  default path `squash/data/models/pose_landmarker_heavy.task`, or pass
+  `--mediapipe-model`). `--backend fake` is synthetic, for tests.
 - `--trim 30` (with optional `--start 60`) analyzes part of a clip.
-  `--capture-fps 240` declares a retimed slo-mo export, and `--capture-fps 60`
-  normal-speed video with Apple metadata.
-- Clips with ambiguous timing are refused with what to do, and clips too
-  short for one swing are refused before anything is billed.
+  `--coarse-fps 15` changes the coarse-pass rate; it never exceeds the clip's
+  own rate, and frames are never duplicated.
+- `--capture-fps 240` declares a retimed slo-mo export, and `--capture-fps 60`
+  normal-speed video with Apple metadata. Clips with ambiguous timing are
+  refused with what to do. One case can't be detected: a slo-mo export whose
+  Apple metadata was stripped looks like ordinary video, so it's accepted
+  with a warning and its timing is wrong until you pass `--capture-fps 240`
+  or use the original file.
+- A span too short for one swing (the whole clip, or what `--start`/`--trim`
+  leave) is refused before anything is billed.
+- `--output-dir` and `--cache-dir` move the run folders and the cache.
+
+Exit codes: 0 done; 1 refused (bad input, or no poses); 2 usage error or not
+built yet; 3 stopped by the frame budget; 4 failed (no key, no model, or a
+gateway or model error). Once a run folder exists, every exit writes its
+`run.json`, including failures, with what was already done and billed.
 
 Each run writes `squash/data/output/<stamp>_<clip>/`:
 
 | File | Holds |
 |---|---|
-| `run.json` | capture setup, timing verdict, renditions, backend, billed frames, checks, config snapshot, code version |
+| `run.json` | status, the request (every option), capture setup, timing verdict, renditions, backend, billed frames, checks, effective config, code version and whether the tree was dirty |
 | `checks.json` | every input check, with its value and limit |
 | `poses.json` | the raw model responses, plus the real time of every posed frame |
 
 Renditions and pose responses are cached under `squash/data/cache/`, keyed
-on content, so a re-run bills nothing (AC-5).
+on content and on everything that shapes them (including `--capture-fps`),
+so a re-run bills nothing (AC-5). A different ffmpeg build encodes slightly
+different renditions, which miss the pose cache and are billed again.
 
 ## Film
 
@@ -78,15 +93,18 @@ python -m m0.timing_probe ~/clips/fh.MOV
 
 # 2. Pose on one swing window (every frame, billed frames capped)
 python -m m0.run_pose_m0 ~/clips/fh.MOV --start 12.4 --duration 1.75 \
-    --stroke forehand --hand right --max-billed-frames 500
+    --stroke forehand --hand right --view side --max-billed-frames 500
 
 # 3. Vision reads of the racket on backswing, contact and finish
 python -m m0.keyframe_probe ../running/data/output/<run-id> --dry-run   # crops only
 python -m m0.keyframe_probe ../running/data/output/<run-id>             # 3 reads
 ```
 
-`--start` is where the swing window begins, in the clip's own seconds. Scrub
-to just before the backswing. Each run writes `m0_summary.md`,
+`--start` is where the swing window begins, in real seconds (the clip's own
+seconds for an original). Scrub to just before the backswing. Add
+`--min-score 0.5` if the model returns per-keypoint scores: lost joints then
+count as unseen, and the key-frame probe uses the same gate. Answered vision
+reads are cached in the run folder, so re-running step 3 doesn't pay again. Each run writes `m0_summary.md`,
 `m0_quality.json`, `m0_timing.json` and `m0_keyframes.json` next to the
 overlay video in `running/data/output/<run-id>/`. Copy the findings into
 [M0_NOTE.md](M0_NOTE.md).
@@ -103,18 +121,20 @@ It is a stand-in, not ViTPose. Download its model (Apache-2.0) first, and keep
 it out of git:
 
 ```bash
-pip install mediapipe
+pip install mediapipe        # already there with the [m0] extra
 curl -LO https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task
 python -m m0.local_pose clip.mov --model pose_landmarker_heavy.task \
     --start 1.12 --duration 3.97 --out data/clip/poses.json
-python -m m0.keypoint_quality data/clip/poses.json --fps 60 \
+python -m m0.keypoint_quality data/clip/poses.json \
     --width 2064 --height 1166 --hand right --min-score 0.5
 ```
 
 Clips from YouTube or other edited sources can show how pose handles a
 squash arm. They can't support any timing result, because slow motion is
-usually edited in. Keep a segment inside one camera shot: a cut reads as the
-fastest motion in the clip. Only use footage you have permission to use.
+usually edited in. `keypoint_quality` uses the per-frame times `local_pose`
+records, so irregular timing in a screen recording is handled. Keep a
+segment inside one camera shot: a cut reads as the fastest motion in the
+clip. Only use footage you have permission to use.
 Example: [m0/findings/2026-11-03-youtube-screen-recordings.md](m0/findings/2026-11-03-youtube-screen-recordings.md).
 
 ## Test
@@ -124,4 +144,6 @@ cd squash && python -m pytest
 ```
 
 The tests use synthetic keypoints and generated clips, so they need no
-network and no key.
+network and no key. Set `SWING_MEDIAPIPE_MODEL` to a downloaded model file to
+include the MediaPipe backend test. One test drives `running/main.py` end to
+end with fake poses and cleans up after itself.

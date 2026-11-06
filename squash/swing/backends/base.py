@@ -1,13 +1,17 @@
 """The pose interface (FR-3), its cache, and the billed-frame budget.
 
 A backend turns one rendition into the gateway's ``vid.pose.kpts`` payload.
+It receives the whole ``Rendition`` (file and per-frame real times), so a
+backend never has to rediscover timing from the file.
 Nothing else in the project calls a model: swing detection, metrics and
 reporting read a ``PoseTrack``, so they test offline.
 
 Caching is here rather than in each backend, keyed on the rendition's bytes
 and everything that shapes the request (``describe()``). A cache hit bills
-nothing (AC-5). The budget is checked **before** a billable call, so
-``--max-billed-frames`` stops a run instead of reporting the overspend.
+nothing (AC-5). The budget is checked twice, both **before** sending: once
+for the whole run (``plan``), so a run that cannot finish spends nothing, and
+again before each billable call. Frames count as billed once a request is
+sent, whether or not it then succeeds: the conservative reading of a bill.
 """
 
 from __future__ import annotations
@@ -41,8 +45,11 @@ class PoseBackend(Protocol):
     def describe(self) -> dict:
         """Everything that shapes the result: model, parameters, versions."""
 
-    def estimate(self, video: Path, *, n_frames: int) -> tuple[dict, dict | None]:
-        """Pose every frame of ``video``. Returns ``(payload, usage)``."""
+    def check_ready(self) -> None:
+        """Raise if the backend cannot run (no key, no model), before any work."""
+
+    def estimate(self, rendition: Rendition) -> tuple[dict, dict | None]:
+        """Pose every frame of ``rendition``. Returns ``(payload, usage)``."""
 
 
 @dataclass
@@ -52,12 +59,21 @@ class FrameBudget:
     limit: int | None = None
     billed: int = 0
 
+    def check_total(self, n: int) -> None:
+        """Refuse a run whose uncached frames exceed the limit, before any request."""
+        if self.limit is not None and self.billed + n > self.limit:
+            raise BudgetExceeded(
+                f"this run needs {n} billable frames, over --max-billed-frames "
+                f"{self.limit}. Nothing was sent. Raise the limit or analyze less of "
+                "the clip (--start/--trim).")
+
     def charge(self, n: int) -> None:
         if self.limit is not None and self.billed + n > self.limit:
             raise BudgetExceeded(
-                f"this call would bill {n} frames, bringing the run to "
-                f"{self.billed + n}, over --max-billed-frames {self.limit}. "
-                "Nothing was sent. Raise the limit or analyze less of the clip (--trim).")
+                f"the next request would bill {n} frames, bringing the run to "
+                f"{self.billed + n}, over --max-billed-frames {self.limit}. That "
+                f"request was not sent; {self.billed} frames were already billed "
+                "this run.")
         self.billed += n
 
 
@@ -112,12 +128,23 @@ class CachedPose:
         self.budget = budget or FrameBudget()
         self.cache_dir = Path(cache_dir) / "poses"
         self.reuse = reuse
+        self.done: list[PoseChunk] = []      # chunks finished so far, for failure records
 
     def cache_path(self, rendition: Rendition) -> Path:
         key = json.dumps({"video": file_digest(rendition.path),
                           "backend": self.backend.describe(),
                           "contract": CACHE_CONTRACT}, sort_keys=True)
         return self.cache_dir / f"poses.{hashlib.sha256(key.encode()).hexdigest()[:16]}.json"
+
+    def is_cached(self, rendition: Rendition) -> bool:
+        return self.reuse and self.cache_path(rendition).is_file()
+
+    def plan(self, renditions: list[Rendition]) -> int:
+        """Billable frames this run would send; refuses up front if over budget."""
+        n = sum(r.n_frames for r in renditions if not self.is_cached(r)) \
+            if self.backend.billable else 0
+        self.budget.check_total(n)
+        return n
 
     def run_one(self, rendition: Rendition) -> PoseChunk:
         path = self.cache_path(rendition)
@@ -129,7 +156,7 @@ class CachedPose:
         if self.backend.billable:
             self.budget.charge(n)        # raises before anything is sent
         t0 = time.perf_counter()
-        payload, usage = self.backend.estimate(rendition.path, n_frames=n)
+        payload, usage = self.backend.estimate(rendition)
         seconds = time.perf_counter() - t0
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
@@ -139,8 +166,11 @@ class CachedPose:
                          False, seconds)
 
     def run(self, renditions: list[Rendition]) -> PoseTrack:
-        chunks = [self.run_one(r) for r in renditions]
-        return join(chunks)
+        self.plan(renditions)
+        self.done = []
+        for r in renditions:
+            self.done.append(self.run_one(r))
+        return join(self.done)
 
 
 def join(chunks: list[PoseChunk]) -> PoseTrack:

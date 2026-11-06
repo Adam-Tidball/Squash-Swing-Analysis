@@ -16,7 +16,9 @@ from pathlib import Path
 import numpy as np
 
 from .. import config as cfg
+from ..ingest import Rendition
 from ..upstream.skeleton import KPT_NAMES
+from .base import file_digest
 
 # BlazePose landmark index for each COCO-17 joint, in KPT_NAMES order.
 BLAZE_FOR_COCO = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
@@ -44,6 +46,9 @@ class MediaPipePose:
     def __init__(self, model: Path = cfg.MEDIAPIPE_MODEL, *, num_poses: int = 2):
         self.model = Path(model)
         self.num_poses = num_poses    # 2, so a second person is seen and can be warned about
+        # Content, not file name: lite/full/heavy downloads are often saved
+        # under the same name, and a swapped model must not reuse old poses.
+        self._digest = file_digest(self.model)[:16] if self.model.is_file() else None
 
     def describe(self) -> dict:
         try:
@@ -51,14 +56,19 @@ class MediaPipePose:
             version = mediapipe.__version__
         except ImportError:
             version = None
-        return {"backend": self.name, "model": self.model.name, "mediapipe": version,
-                "num_poses": self.num_poses}
+        return {"backend": self.name, "model": self.model.name, "model_sha256": self._digest,
+                "mediapipe": version, "num_poses": self.num_poses}
 
-    def estimate(self, video: Path, *, n_frames: int) -> tuple[dict, dict | None]:
+    def check_ready(self) -> None:
         if not self.model.is_file():
             raise FileNotFoundError(
                 f"MediaPipe model not found at {self.model}. Download "
-                "pose_landmarker_heavy.task (see README) into squash/data/models/.")
+                "pose_landmarker_heavy.task (see README) into squash/data/models/, "
+                "or pass --mediapipe-model.")
+        import mediapipe  # noqa: F401  (fails here, not mid-run, if missing)
+
+    def estimate(self, rendition: Rendition) -> tuple[dict, dict | None]:
+        self.check_ready()
         import cv2
         import mediapipe as mp
         from mediapipe.tasks.python import BaseOptions, vision
@@ -66,7 +76,7 @@ class MediaPipePose:
         options = vision.PoseLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(self.model)),
             running_mode=vision.RunningMode.VIDEO, num_poses=self.num_poses)
-        cap = cv2.VideoCapture(str(video))
+        cap = cv2.VideoCapture(str(rendition.path))
         frames, items = [], []
         try:
             with vision.PoseLandmarker.create_from_options(options) as landmarker:
@@ -75,7 +85,11 @@ class MediaPipePose:
                     ok, bgr = cap.read()
                     if not ok:
                         break
-                    ms = max(int(round(cap.get(cv2.CAP_PROP_POS_MSEC))), last_ms + 1)
+                    # The rendition's own real time per frame; the tracker only
+                    # needs it increasing, and real time is what it models.
+                    t = (rendition.real_times[i] if i < rendition.n_frames
+                         else cap.get(cv2.CAP_PROP_POS_MSEC) / 1000)
+                    ms = max(int(round(t * 1000)), last_ms + 1)
                     last_ms = ms
                     image = mp.Image(image_format=mp.ImageFormat.SRGB,
                                      data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))

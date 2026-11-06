@@ -8,11 +8,9 @@ is an ellipse on screen, and its speed peak moves off the middle of the swing.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
-from ..timing import ffprobe_json, frame_times
+from ..ingest import Rendition
 from ..upstream.skeleton import KPT_NAMES
 
 BODY = {
@@ -27,7 +25,7 @@ BODY = {
 
 def pose_at(t: float, *, hand: str, swings: tuple[float, ...], aspect: float,
             rng: np.random.Generator | None = None, noise: float = 0.0) -> list[list[float]]:
-    """COCO-17 normalized keypoints at media time ``t``."""
+    """COCO-17 normalized keypoints at time ``t`` (same clock as ``swings``)."""
     k = dict(BODY)
     nearest = min(swings, key=lambda s: abs(s - t)) if swings else 1e9
     phase = np.tanh((t - nearest) * 12)            # -1 backswing .. +1 follow-through
@@ -48,7 +46,11 @@ def pose_at(t: float, *, hand: str, swings: tuple[float, ...], aspect: float,
 
 
 class FakePose:
-    """Swings at ``swings`` (seconds of the rendition's own media time)."""
+    """Swings at ``swings``: real seconds into the *source* clip.
+
+    Uses each rendition frame's real time, so a swing lands where it was
+    asked for whatever the chunking, sampling rate or retiming.
+    """
 
     name = "fake"
 
@@ -63,25 +65,26 @@ class FakePose:
         return {"backend": self.name, "hand": self.hand, "swings": list(self.swings),
                 "second_person": self.second_person, "noise": self.noise, "seed": self.seed}
 
-    def estimate(self, video: Path, *, n_frames: int) -> tuple[dict, dict | None]:
+    def check_ready(self) -> None:
+        pass
+
+    def estimate(self, rendition: Rendition) -> tuple[dict, dict | None]:
         self.calls += 1
-        stream = next(s for s in ffprobe_json(video)["streams"] if s["codec_type"] == "video")
-        aspect = int(stream["width"]) / int(stream["height"])
-        times = frame_times(video)
+        aspect = rendition.width / rendition.height
         rng = np.random.default_rng(self.seed)
         items = []
-        for i, t in enumerate(times):
+        for i, t in enumerate(rendition.real_times):
             items.append({"frame_id": i, "track_id": 0, "bbox_xywh": [0.36, 0.15, 0.30, 0.74],
                           "kpts_xy": pose_at(float(t), hand=self.hand, swings=self.swings,
                                              aspect=aspect, rng=rng, noise=self.noise),
                           "kpts_scores": [0.95] * 17})
             if self.second_person:
+                still = pose_at(float(t), hand=self.hand, swings=(), aspect=aspect)
+                shifted = [[min(0.99, x + 0.35), y] for x, y in still]
                 items.append({"frame_id": i, "track_id": 1,
                               "bbox_xywh": [0.75, 0.20, 0.15, 0.60],
-                              "kpts_xy": [[min(0.99, x + 0.35), y] for x, y in pose_at(
-                                  float(t), hand=self.hand, swings=(), aspect=aspect)],
-                              "kpts_scores": [0.9] * 17})
+                              "kpts_xy": shifted, "kpts_scores": [0.9] * 17})
+        frames = [{"frame_id": i} for i in range(rendition.n_frames)]
         payload = {"content": {"object": "vid.pose.kpts", "kpts_labels": KPT_NAMES,
-                               "frames": [{"frame_id": i} for i in range(len(times))],
-                               "items": items}}
+                               "frames": frames, "items": items}}
         return payload, {"fake": True}

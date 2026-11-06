@@ -8,21 +8,33 @@ version = "0.1.0"
 description = "Per-swing technique analysis from iPhone slo-mo squash practice clips."
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
+# The core needs no OpenCV: ffmpeg does all decoding. Everything that does
+# use cv2 takes it from one build, opencv-contrib-python, which mediapipe
+# requires anyway; mixing OpenCV wheels in one environment breaks `import cv2`.
 dependencies = [
     "numpy>=1.26",
     "openai>=1.40",
-    "opencv-python-headless>=4.9",
     "python-dotenv>=1.0",
-    "rich>=13",
 ]
 
 [project.optional-dependencies]
-local = ["mediapipe"]
-vision = ["typesafe-sdk==0.7.0"]
+local = ["mediapipe"]                       # local stand-in pose backend (brings cv2)
+m0 = [                                      # M0 tools; they drive the repo's running/ demo
+    "mediapipe", "rich>=13", "matplotlib>=3.8", "pillow>=10", "typesafe-sdk==0.7.0",
+]
 test = ["pytest"]
 
 [project.scripts]
 swing = "swing.cli:main"
 
+# Only the product ships. The M0 tools stay in the checkout and run as
+# `python -m m0.<tool>` from squash/ (they drive the repo's running/ demo).
 [tool.setuptools.packages.find]
-include = ["swing*", "m0*"]
+include = ["swing*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "B", "UP", "SIM"]

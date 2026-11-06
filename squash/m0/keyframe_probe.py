@@ -21,6 +21,8 @@ every read can be checked by eye.
     python -m m0.keyframe_probe ../running/data/output/<run-id>
 
 ``--dry-run`` writes the crops and the exact questions, and calls nothing.
+Answered reads are cached in the run folder, keyed on the image and the exact
+questions, so a re-run does not pay for them again.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import sys
 import time
@@ -37,6 +40,8 @@ import numpy as np
 
 from . import keypoint_quality as kq
 
+SQUASH_DIR = Path(__file__).resolve().parents[1]
+
 READ_MODEL = "google/gemma-4-26b-a4b-it"     # the model deadlift settled on
 TYPESAFE_BASE_URL = "https://gateway.vlm.run/typesafe"
 IMAGE_LONG_EDGE = 1024
@@ -45,9 +50,16 @@ JPEG_QUALITY = 90
 CROP_PAD = 0.6          # share of the person box added on every side; the racket is long
 SEARCH_SECONDS = 0.6    # backswing / finish search either side of contact
 
-STATE = "A side view of a squash player hitting a drive during solo practice."
+# The view the clip was filmed from goes into the description the model reads.
+STATE_TEMPLATE = "A {view} view of a squash player hitting a drive during solo practice."
+VIEW_WORDS = {"side": "side", "back": "behind-the-player"}
 
-# Every question carries an explicit "cannot tell" label. The RFP's rule is
+
+def state_for(view: str) -> str:
+    return STATE_TEMPLATE.format(view=VIEW_WORDS.get(view, view))
+
+# Every question has a way to abstain: "cannot_tell", or "not_visible" for
+# the visibility question itself. The RFP's rule is
 # that low confidence becomes Can't assess, never a guess, and a question
 # with no way to abstain forces one.
 QUESTIONS = {
@@ -94,13 +106,17 @@ QUESTIONS = {
 }
 
 
-def key_frames(xy: np.ndarray, index: np.ndarray, *, fps: float, hand: str) -> dict[str, int]:
-    """Frame indices (source numbering) of backswing, contact and finish."""
-    unit = kq.torso_length(xy)
-    speed = kq.wrist_speed(xy, fps, hand, unit)
-    c = int(np.nanargmax(speed))
-    reach = round(SEARCH_SECONDS * fps)
-    wy = xy[:, kq.J[f"{hand}_wrist"], 1]       # image y: smaller is higher
+def key_frames(xy: np.ndarray, scores: np.ndarray | None, t: np.ndarray,
+               index: np.ndarray, *, hand: str, min_score: float | None = None
+               ) -> dict[str, int]:
+    """Frame indices of backswing, contact and finish.
+
+    Contact is ``keypoint_quality.contact``: the same rule, and the same gate,
+    as the quality report. Backswing and finish are the highest *seen* wrist
+    within ``SEARCH_SECONDS`` of real time before and after it.
+    """
+    c, _, _ = kq.contact(xy, scores, t, hand=hand, min_score=min_score)
+    wy = kq.gate(xy, scores, min_score)[:, kq.J[f"{hand}_wrist"], 1]   # image y: smaller is higher
 
     def highest(lo: int, hi: int) -> int:
         seg = wy[lo:hi]
@@ -108,25 +124,46 @@ def key_frames(xy: np.ndarray, index: np.ndarray, *, fps: float, hand: str) -> d
             return c
         return lo + int(np.nanargmin(seg))
 
+    lo = int(np.searchsorted(t, t[c] - SEARCH_SECONDS - 1e-9))
+    hi = int(np.searchsorted(t, t[c] + SEARCH_SECONDS + 1e-9, side="right"))
     return {
-        "backswing": int(index[highest(max(0, c - reach), c)]),
+        "backswing": int(index[highest(lo, c)]),
         "contact": int(index[c]),
-        "finish": int(index[highest(c + 1, min(len(wy), c + reach + 1))]),
+        "finish": int(index[highest(c + 1, hi)]),
     }
 
 
-def crop_frame(video: Path, frame_no: int, box_xywh, out: Path) -> str:
-    """Decode one frame, crop to the padded box, save a JPEG, return a data URL."""
+def read_frames(video: Path, wanted: set[int]) -> dict[int, np.ndarray]:
+    """Decode sequentially and keep the wanted frames, numbered in decode order.
+
+    Never seeks by frame number: in files with hidden or repeated packets the
+    container's frame numbers and the decoded frames disagree.
+    """
     import cv2
 
+    frames: dict[int, np.ndarray] = {}
     cap = cv2.VideoCapture(str(video))
     try:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
-        ok, frame = cap.read()
+        i = 0
+        while len(frames) < len(wanted):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if i in wanted:
+                frames[i] = frame
+            i += 1
     finally:
         cap.release()
-    if not ok:
-        raise RuntimeError(f"could not read frame {frame_no} of {video}")
+    missing = wanted - frames.keys()
+    if missing:
+        raise RuntimeError(f"{video} has no frame(s) {sorted(missing)}")
+    return frames
+
+
+def crop_frame(frame: np.ndarray, box_xywh, out: Path) -> tuple[str, bytes]:
+    """Crop to the padded box, save a JPEG, return ``(data URL, jpeg bytes)``."""
+    import cv2
+
     h, w = frame.shape[:2]
     x, y, bw, bh = box_xywh
     x0, y0 = max(0.0, x - CROP_PAD * bw), max(0.0, y - CROP_PAD * bh)
@@ -135,13 +172,24 @@ def crop_frame(video: Path, frame_no: int, box_xywh, out: Path) -> str:
     scale = IMAGE_LONG_EDGE / max(img.shape[:2])
     if scale < 1:
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out), img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
+    if not ok:
+        raise RuntimeError("JPEG encode failed")
+    data = buf.tobytes()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(data)
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode(), data
 
 
-async def ask(images: dict[str, str], api_key: str) -> dict:
+def read_key(name: str, jpeg: bytes, state: str) -> str:
+    """Cache key for one read: the image, the model, and the exact questions asked."""
+    spec = {q: QUESTIONS[q] for q in QUESTIONS if name in QUESTIONS[q]["frames"]}
+    blob = json.dumps({"model": READ_MODEL, "state": state, "questions": spec,
+                       "detail": IMAGE_DETAIL}, sort_keys=True).encode()
+    return hashlib.sha256(blob + jpeg).hexdigest()[:16]
+
+
+async def ask(images: dict[str, str], api_key: str, state: str) -> dict:
     from typesafe_sdk import AsyncTypeSafeClient, Choice, RetryPolicy, TypeSafeError
 
     results = {}
@@ -153,7 +201,7 @@ async def ask(images: dict[str, str], api_key: str) -> dict:
                       for q, spec in QUESTIONS.items() if key in spec["frames"]}
             t0 = time.perf_counter()
             try:
-                r = await client.system_one(STATE, wanted, extra_body={"content": [
+                r = await client.system_one(state, wanted, extra_body={"content": [
                     {"type": "image_url", "image_url": {"url": url, "detail": IMAGE_DETAIL}}]})
             except TypeSafeError as exc:
                 results[key] = {"error": str(exc).splitlines()[0][:200]}
@@ -173,39 +221,61 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Racket reads on key frames (M0).")
     ap.add_argument("run_dir", type=Path, help="an M0 run folder (has m0_timing.json)")
     ap.add_argument("--dry-run", action="store_true", help="save crops and questions only")
+    ap.add_argument("--min-score", type=float,
+                    help="default: the gate the quality report used")
     args = ap.parse_args(argv)
 
     timing = json.loads((args.run_dir / "m0_timing.json").read_text())
     quality = json.loads((args.run_dir / "m0_quality.json").read_text())
     meta, window = timing["meta"], timing["window"]
+    min_score = args.min_score if args.min_score is not None else quality.get("min_score")
+    state = state_for(meta.get("view", "side"))
     video = Path(meta["cut"])
     width, height = window["width"], window["height"]
     if abs(window["rotation"]) in (90, 270):
         width, height = height, width
 
-    frames = kq.frames_from_payload(json.loads((args.run_dir / "poses.json").read_text()))
+    frames = kq.load_frames(args.run_dir / "poses.json")
     persons, _ = kq.lock_player(frames)
-    xy, _, _ = kq.keypoint_arrays(persons, width=width, height=height)
+    xy, scores, _ = kq.keypoint_arrays(persons, width=width, height=height)
+    t = kq.frame_times(frames, quality.get("fps"))
     index = np.array([f["index"] for f in frames])
-    keys = key_frames(xy, index, fps=quality["fps"], hand=meta["hand"])
+    keys = key_frames(xy, scores, t, index, hand=meta["hand"], min_score=min_score)
+    if keys["contact"] != quality["peak"]["frame"]:
+        print(f"note: contact frame {keys['contact']} differs from the quality report's "
+              f"{quality['peak']['frame']} (different --min-score?)")
 
-    images = {}
-    by_frame = {f["index"]: p for f, p in zip(frames, persons)}
+    by_frame = {f["index"]: p for f, p in zip(frames, persons, strict=True)}
+    wanted = {n for n in keys.values() if by_frame.get(n) is not None}
+    decoded = read_frames(video, wanted)
+    images, jpegs = {}, {}
     for name, frame_no in keys.items():
         person = by_frame.get(frame_no)
         if person is None:
             print(f"{name}: no player at frame {frame_no}, skipped")
             continue
-        images[name] = crop_frame(video, frame_no, person["bbox_xywh"],
-                                  args.run_dir / "keyframes" / f"{name}_{frame_no}.jpg")
+        images[name], jpegs[name] = crop_frame(
+            decoded[frame_no], person["bbox_xywh"],
+            args.run_dir / "keyframes" / f"{name}_{frame_no}.jpg")
 
-    out = {"model": READ_MODEL, "state": STATE, "questions": QUESTIONS,
+    out = {"model": READ_MODEL, "state": state, "questions": QUESTIONS, "min_score": min_score,
            "key_frames": keys, "dry_run": args.dry_run}
     if not args.dry_run:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "running"))
-        from src.env import load_api_key
-        api_key, _ = load_api_key(Path(__file__).resolve().parents[2] / "running")
-        out["reads"] = asyncio.run(ask(images, api_key))
+        # Reads are billed: reuse any answered for the same image and questions.
+        cache_file = args.run_dir / "m0_reads_cache.json"
+        cache = json.loads(cache_file.read_text()) if cache_file.is_file() else {}
+        keyed = {name: read_key(name, jpegs[name], state) for name in images}
+        todo = {name: url for name, url in images.items() if keyed[name] not in cache}
+        if todo:
+            from swing.upstream.env import load_api_key
+            api_key, _ = load_api_key(SQUASH_DIR)
+            fresh = asyncio.run(ask(todo, api_key, state))
+            cache.update({keyed[n]: r for n, r in fresh.items() if "error" not in r})
+            cache_file.write_text(json.dumps(cache, indent=2))
+        else:
+            fresh = {}
+        out["reads"] = {name: fresh.get(name) or {**cache[keyed[name]], "cached": True}
+                        for name in images}
 
     (args.run_dir / "m0_keyframes.json").write_text(json.dumps(out, indent=2))
     print(json.dumps({"key_frames": keys, "reads": out.get("reads", "dry run")}, indent=2))

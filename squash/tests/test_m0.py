@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import shutil
 import subprocess
 
@@ -10,7 +12,20 @@ import pytest
 
 from m0 import keypoint_quality as kq
 from m0 import keyframe_probe, timing_probe
-from m0.run_pose_m0 import fake_payload
+from swing.backends.fake import pose_at
+from swing.upstream import pose as upstream_pose
+from swing.upstream.skeleton import KPT_NAMES
+
+
+def fake_payload(n_frames: int, fps: float, hand: str, *, aspect: float = 16 / 9) -> dict:
+    """One synthetic swing peaking mid-clip, in the gateway's response shape."""
+    swing_at = n_frames / 2 / fps
+    items = [{"frame_id": i, "track_id": 0, "bbox_xywh": [0.36, 0.15, 0.30, 0.74],
+              "kpts_xy": pose_at(i / fps, hand=hand, swings=(swing_at,), aspect=aspect)}
+             for i in range(n_frames)]
+    return {"content": {"object": "vid.pose.kpts", "kpts_labels": KPT_NAMES,
+                        "frames": [{"frame_id": i} for i in range(n_frames)],
+                        "items": items}}
 
 
 # ── keypoints ────────────────────────────────────────────────────────────────
@@ -39,7 +54,7 @@ def test_wrist_speed_in_torso_lengths_per_second():
     xy = standing(n)
     # Right wrist moves 2 torso lengths (200 px) in 1 s at constant speed.
     xy[:, kq.J["right_wrist"], 0] = 480 + np.linspace(0, 200, n)
-    speed = kq.wrist_speed(xy, fps, "right", kq.torso_length(xy))
+    speed = kq.wrist_speed(xy, np.arange(n) / fps, "right", kq.torso_length(xy))
     assert np.median(speed) == pytest.approx(2.0, rel=1e-3)
 
 
@@ -79,8 +94,8 @@ def test_gap_reported_in_ms():
 
 def test_wrist_swap_detected_once():
     xy = standing(20)
-    l, r = kq.J["left_wrist"], kq.J["right_wrist"]
-    xy[10:, [l, r]] = xy[10:, [r, l]]                     # labels exchange at frame 10
+    lw, rw = kq.J["left_wrist"], kq.J["right_wrist"]
+    xy[10:, [lw, rw]] = xy[10:, [rw, lw]]                 # labels exchange at frame 10
     assert kq.wrist_swaps(xy, 100.0) == [10]
 
 
@@ -121,7 +136,7 @@ def test_fake_payload_round_trips_through_the_reader():
     persons, crowded = kq.lock_player(frames)
     xy, _, _ = kq.keypoint_arrays(persons, width=1280, height=720)
     report = kq.analyze(xy, None, fps=240.0, hand="right")
-    assert crowded == 0 and abs(report["peak"]["frame"] - 120) <= 3
+    assert crowded == 0 and abs(report["peak"]["frame"] - 120) <= 1
 
 
 def test_key_frames_order():
@@ -129,8 +144,82 @@ def test_key_frames_order():
     frames = kq.frames_from_payload(payload)
     persons, _ = kq.lock_player(frames)
     xy, _, _ = kq.keypoint_arrays(persons, width=1280, height=720)
-    keys = keyframe_probe.key_frames(xy, np.arange(240), fps=240.0, hand="right")
+    keys = keyframe_probe.key_frames(xy, None, np.arange(240) / 240.0, np.arange(240),
+                                     hand="right")
     assert keys["backswing"] < keys["contact"] < keys["finish"]
+
+
+def test_missing_frames_do_not_fake_a_peak():
+    # M5: frames 100-199 absent from the response; the wrist moves at a
+    # constant 2 torso lengths/s throughout.
+    fps, n = 240.0, 300
+    xy = standing(n)
+    xy[:, kq.J["right_wrist"], 0] = 480 + np.arange(n) * 200 / fps
+    keep = np.r_[0:100, 200:300]
+    report = kq.analyze(xy[keep], None, fps=fps, hand="right", frame_index=keep)
+    assert report["peak"]["wrist_speed_torso_per_s"] == pytest.approx(2.0, rel=0.02)
+    assert report["clip"]["hitting_wrist_longest_gap_ms"] == pytest.approx(100 / fps * 1000,
+                                                                           abs=0.5)
+
+
+def test_recorded_times_win_over_fps():
+    frames = [{"index": i, "time": i * 0.02, "persons": []} for i in range(3)]
+    assert np.allclose(kq.frame_times(frames, fps=240), [0, 0.02, 0.04])
+    with pytest.raises(kq.QualityError):
+        kq.frame_times([{"index": 0, "persons": []}], fps=None)
+
+
+def test_key_frames_use_the_quality_reports_contact():
+    # M6: wrist lost (score 0) for 20 frames and re-found far away. Gated,
+    # both tools agree on contact, and it is a frame where the wrist was seen.
+    payload = fake_payload(300, 240.0, "right")
+    frames = kq.frames_from_payload(payload)
+    persons, _ = kq.lock_player(frames)
+    xy, _, _ = kq.keypoint_arrays(persons, width=1280, height=720)
+    scores = np.ones((300, 17))
+    w = kq.J["right_wrist"]
+    xy[180:200, w] = (900, 100)
+    scores[180:200, w] = 0.0
+    t, idx = np.arange(300) / 240.0, np.arange(300)
+    report = kq.analyze(xy, scores, times=t, hand="right", frame_index=idx, min_score=0.5)
+    keys = keyframe_probe.key_frames(xy, scores, t, idx, hand="right", min_score=0.5)
+    assert keys["contact"] == report["peak"]["frame"]
+    assert scores[keys["contact"], w] >= 0.5
+
+
+def test_wrist_never_seen_is_reported_not_crashed():
+    xy = standing(50)
+    xy[:, kq.J["right_wrist"]] = np.nan
+    with pytest.raises(kq.QualityError, match="right wrist is seen in 0"):
+        kq.analyze(xy, None, fps=60.0, hand="right")
+
+
+def test_reads_a_swing_runs_poses_json(tmp_path):
+    a, b = fake_payload(10, 30.0, "right"), fake_payload(5, 30.0, "right")
+    times = [i / 30 for i in range(15)]
+    path = tmp_path / "poses.json"
+    path.write_text(json.dumps({"times": times, "chunks": [{"payload": a}, {"payload": b}]}))
+    frames = kq.load_frames(path)
+    assert [f["index"] for f in frames] == list(range(15))
+    assert frames[-1]["time"] == pytest.approx(14 / 30)
+
+
+def test_m0_driver_request_bills_exactly_the_window(tmp_path):
+    # M7: with EVERY_FRAME off, upstream sends VIDEO_MAX_FRAMES as given; with
+    # it on, upstream would replace it with its own count.
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"x")
+    _, extra = upstream_pose.build_request(video, every_frame=False, fps=240, n_frames=999,
+                                           video_fps=240, video_max_frames=420, precision=4)
+    assert extra["video_max_frames"] == 420
+    _, extra = upstream_pose.build_request(video, every_frame=True, fps=240, n_frames=999,
+                                           video_fps=240, video_max_frames=420, precision=4)
+    assert extra["video_max_frames"] == 999      # why the driver turns EVERY_FRAME off
+
+
+def test_state_follows_the_filmed_view():
+    assert "side view" in keyframe_probe.state_for("side")
+    assert "behind" in keyframe_probe.state_for("back")
 
 
 def test_every_question_can_abstain():
@@ -188,6 +277,11 @@ def test_irregular_intervals_flagged():
     assert r.irregular_intervals == 1
 
 
+def test_zero_frames_is_unknown_with_a_reason():
+    r = timing_probe.classify(probe_dict("240/1"), np.array([]))
+    assert r.verdict == "unknown" and "no decodable video frames" in r.notes[0]
+
+
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
 def test_probe_real_generated_clip(tmp_path):
     clip = tmp_path / "c.mp4"
@@ -197,3 +291,36 @@ def test_probe_real_generated_clip(tmp_path):
     r = timing_probe.probe(clip)
     assert r.verdict == "native" and r.n_frames == 240
     assert r.media_seconds == pytest.approx(1.0, rel=0.01)
+
+
+RUNNING_DEPS = all(importlib.util.find_spec(m) for m in ("cv2", "rich", "matplotlib", "PIL"))
+
+
+@pytest.mark.skipif(not (shutil.which("ffmpeg") and RUNNING_DEPS),
+                    reason="needs ffmpeg and running/'s dependencies")
+def test_m0_fake_run_end_to_end(tmp_path):
+    """run_pose_m0 --fake-gateway, through running/main.py in its own process."""
+    from m0 import run_pose_m0
+
+    clip = tmp_path / "c240.mp4"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+                    "-i", "testsrc=size=320x240:rate=240", "-t", "3",
+                    "-pix_fmt", "yuv420p", str(clip)], check=True)
+    before = set((run_pose_m0.RUNNING_DIR / "data" / "output").glob("*-m0-*"))
+    try:
+        assert run_pose_m0.main([str(clip), "--start", "1.0", "--duration", "1.0",
+                                 "--stroke", "forehand", "--fake-gateway"]) == 0
+        new = set((run_pose_m0.RUNNING_DIR / "data" / "output").glob("*-m0-*")) - before
+        assert len(new) == 1
+        run = new.pop()
+        quality = json.loads((run / "m0_quality.json").read_text())
+        meta = json.loads((run / "m0_timing.json").read_text())["meta"]
+        assert meta["billed_frames_requested"] == 240
+        assert abs(quality["peak"]["seconds"] - 1.5) < 0.02     # swing placed mid-window
+        assert keyframe_probe.main([str(run), "--dry-run"]) == 0
+        assert len(list((run / "keyframes").glob("*.jpg"))) == 3
+    finally:
+        for p in set((run_pose_m0.RUNNING_DIR / "data" / "output").glob("*-m0-*")) - before:
+            shutil.rmtree(p)
+        for p in (run_pose_m0.RUNNING_DIR / "data" / "input").glob("m0_c240_*"):
+            p.unlink()

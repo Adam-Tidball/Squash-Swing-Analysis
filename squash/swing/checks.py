@@ -15,8 +15,8 @@ from dataclasses import asdict, dataclass
 
 from . import config as cfg
 from .backends.base import PoseTrack
+from .geometry import area, touches_edge
 from .ingest import Capture, Source
-from .upstream.pose import _iou
 
 
 @dataclass
@@ -31,7 +31,10 @@ class Check:
         return asdict(self)
 
 
-def before_pose(source: Source, capture: Capture) -> list[Check]:
+def before_pose(source: Source, capture: Capture, *, start: float = 0.0,
+                duration: float | None = None, coarse_fps: float | None = None) -> list[Check]:
+    """Checks that need only the probe. ``start``/``duration`` are the span
+    being analyzed (real seconds), which is what has to hold a swing."""
     t = source.timing
     out = [Check("timing", "ok" if t.verdict == "native" else "warn",
                  f"clock: {t.verdict}; real time = media time x {source.scale:g}",
@@ -46,15 +49,25 @@ def before_pose(source: Source, capture: Capture) -> list[Check]:
     out.append(Check("frame_rate", "ok" if fps >= cfg.MIN_CAPTURE_FPS else "warn",
                      f"{fps:.1f} real frames per second"
                      + ("" if fps >= cfg.MIN_CAPTURE_FPS else
-                        f"; the capture protocol asks for 240 (warn below {cfg.MIN_CAPTURE_FPS:g})"),
+                        "; the capture protocol asks for 240 "
+                        f"(warn below {cfg.MIN_CAPTURE_FPS:g})"),
                      round(fps, 3), cfg.MIN_CAPTURE_FPS))
 
-    seconds = source.real_seconds
+    end = source.real_seconds if duration is None else min(source.real_seconds,
+                                                           start + duration)
+    seconds = max(0.0, end - start)
+    whole = start == 0 and duration is None
+    what = "real seconds" if whole else f"real seconds analyzed (from {start:g} s)"
     out.append(Check("duration", "ok" if seconds >= cfg.MIN_CLIP_SECONDS else "error",
-                     f"{seconds:.2f} real seconds"
+                     f"{seconds:.2f} {what}"
                      + ("" if seconds >= cfg.MIN_CLIP_SECONDS else
                         f"; too short to hold one swing window ({cfg.MIN_CLIP_SECONDS:g} s)"),
                      round(seconds, 3), cfg.MIN_CLIP_SECONDS))
+    if coarse_fps is not None and coarse_fps > fps:
+        out.append(Check("coarse_rate", "info",
+                         f"coarse rate {coarse_fps:g} fps is above the clip's {fps:.1f}; "
+                         "every frame is used instead (frames are never duplicated)",
+                         round(fps, 3), coarse_fps))
 
     if t.irregular_intervals:
         out.append(Check("frame_intervals", "warn",
@@ -66,23 +79,9 @@ def before_pose(source: Source, capture: Capture) -> list[Check]:
                      "no audio: ball-impact timing unavailable for this clip",
                      bool(t.audio)))
     if capture.stroke not in ("forehand", "backhand"):
-        out.append(Check("stroke", "warn",
-                         f"stroke '{capture.stroke}': v1 rubrics cover forehand and backhand drives only"))
+        out.append(Check("stroke", "warn", f"stroke '{capture.stroke}': v1 rubrics cover "
+                         "forehand and backhand drives only"))
     return out
-
-
-def _distinct(persons: list[dict]) -> list[dict]:
-    kept: list[dict] = []
-    for p in persons:
-        box = p.get("bbox_xywh")
-        if box and all(_iou(box, k["bbox_xywh"]) < cfg.PERSON_IOU for k in kept):
-            kept.append(p)
-    return kept
-
-
-def _touches_edge(box, margin: float) -> bool:
-    x, y, w, h = box
-    return x <= margin or y <= margin or x + w >= 1 - margin or y + h >= 1 - margin
 
 
 def after_pose(track: PoseTrack) -> list[Check]:
@@ -90,14 +89,17 @@ def after_pose(track: PoseTrack) -> list[Check]:
     if not n:
         return [Check("poses", "error", "the pose model returned no frames", 0)]
 
-    nobody = sum(1 for ps in track.persons if not ps)
-    crowded = sum(1 for ps in track.persons if len(_distinct(ps)) > 1)
+    # A person without a box cannot be placed; such frames count as empty.
+    boxed = [[p for p in ps if p.get("bbox_xywh")] for ps in track.persons]
+    nobody = sum(1 for ps in boxed if not ps)
+    # join() already merged duplicate boxes (IoU > PERSON_IOU), so every
+    # remaining box is a distinct person.
+    crowded = sum(1 for ps in boxed if len(ps) > 1)
     # The player for this check is the largest box: the one-player lock (FR-6)
     # arrives with swing detection, and a cropped player is usually the
     # largest person in frame anyway.
-    largest = [max(ps, key=lambda p: p["bbox_xywh"][2] * p["bbox_xywh"][3])
-               for ps in track.persons if ps]
-    clipped = sum(1 for p in largest if _touches_edge(p["bbox_xywh"], cfg.EDGE_MARGIN))
+    largest = [max(ps, key=lambda p: area(p["bbox_xywh"])) for ps in boxed if ps]
+    clipped = sum(1 for p in largest if touches_edge(p["bbox_xywh"], cfg.EDGE_MARGIN))
 
     def share_check(id_, count, denom, limit, what):
         share = count / denom if denom else 0.0

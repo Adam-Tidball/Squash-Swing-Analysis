@@ -5,16 +5,20 @@ either plumbing (paths, formats), safety limits, or starting points that say
 where they came from and what will replace them. None is a technique
 threshold: those come from coach-labelled reps in M4.
 
-Override per run from the CLI where a flag exists. Otherwise edit here; the
-snapshot records what each run used.
+Override per run from the CLI where a flag exists. Otherwise edit here.
+``run.json`` stores this snapshot with the run's CLI overrides applied, plus
+the request itself (``request``), so it records what each run used.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 SQUASH_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = SQUASH_DIR / "data"
+# Data stays beside the project in a checkout. Set SWING_DATA_DIR to put it
+# elsewhere (needed for a non-editable install, which has no project dir).
+DATA_DIR = Path(os.environ.get("SWING_DATA_DIR") or SQUASH_DIR / "data")
 CACHE_DIR = DATA_DIR / "cache"        # renditions and pose responses, reused across runs
 OUTPUT_DIR = DATA_DIR / "output"      # one folder per run
 RUN_STAMP_FORMAT = "%Y%m%d-%H%M%S"
@@ -78,10 +82,10 @@ MULTI_PERSON_WARN_SHARE = 0.05
 NOBODY_WARN_SHARE = 0.10
 
 
-def snapshot() -> dict:
-    """Every setting above, as plain JSON values, for ``run.json``."""
+def snapshot(**overrides) -> dict:
+    """Every setting above as plain JSON values, with a run's overrides applied."""
     out = {}
-    for name, value in globals().items():
-        if name.isupper():
-            out[name] = str(value) if isinstance(value, Path) else value
+    for name, value in {**{k: v for k, v in globals().items() if k.isupper()},
+                        **overrides}.items():
+        out[name] = str(value) if isinstance(value, Path) else value
     return out
